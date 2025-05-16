@@ -2,7 +2,6 @@ namespace ObjectPool.App;
 
 public class TestModel : PoolObject<TestModel>
 {
-
     public TestModel()
     {
         Id = Guid.NewGuid().ToString();
