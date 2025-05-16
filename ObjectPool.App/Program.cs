@@ -1,23 +1,22 @@
 ﻿using ObjectPool.App;
 
-// Initialisierung des Pools mit 5 Objekten
-Console.WriteLine("=== Pool Initialisierung ===");
+// Initialize the pool with 5 objects
+Console.WriteLine("=== Pool Initialization ===");
 TestModel.Create(5);
 
-// Test 1: Grundlegende Pool-Operationen
-Console.WriteLine("\n=== Test 1: Basis Pool-Operationen ===");
-var poolObject = TestModel.Get(() => new TestModel("223-10-01", "TestModel1", "Dies ist ein Testmodell."));
-poolObject.Name = "TestModel1";
+// Test 1: Basic pool operations
+Console.WriteLine("\n=== Test 1: Basic Pool Operations ===");
+var poolObject = TestModel.Get(() => new TestModel("223-10-01", "TestModel1", "This is a test model."));
 
-Console.WriteLine("\nObjekt Details:");
-Console.WriteLine($"Name: {poolObject.Name}");
-Console.WriteLine($"Id: {poolObject.Id}");
-Console.WriteLine($"Description: {poolObject.Description}");
+Console.WriteLine("\nObject Details:");
+Console.WriteLine($"Name: {poolObject?.Name}");
+Console.WriteLine($"Id: {poolObject?.Id}");
+Console.WriteLine($"Description: {poolObject?.Description}");
 Console.WriteLine("\nPool Status:");
 Console.WriteLine($"Count Active: {TestModel.CountActive}");
 Console.WriteLine($"Count Inactive: {TestModel.CountInactive}");
 
-Console.WriteLine("\n=== Test 2: Objekt Freigabe und Wiederverwendung ===");
+Console.WriteLine("\n=== Test 2: Object Release and Reuse ===");
 TestModel.Release(poolObject);
 poolObject = TestModel.Get();
 poolObject.Name = "TestModel2";
@@ -28,10 +27,10 @@ Console.WriteLine($"Count Inactive: {TestModel.CountInactive}");
 Console.WriteLine($"Current Size: {TestModel.CurrentSize}");
 Console.WriteLine($"Max Pool Size: {TestModel.MaxPoolSize}");
 
-Console.WriteLine("\n=== Test 3: Pool zurücksetzen ===");
+Console.WriteLine("\n=== Test 3: Pool Reset ===");
 TestModel.Dispose();
 
-Console.WriteLine("\n=== Test 4: Neues Objekt nach Dispose ===");
+Console.WriteLine("\n=== Test 4: New Object After Dispose ===");
 var poolObject2 = TestModel.Get();
 poolObject2.Name = "TestModel3";
 Console.WriteLine($"Name: {poolObject2.Name}");

@@ -105,7 +105,7 @@ public abstract class PoolObject<T> where T : class, new()
                 return obj!;
             }
             // Pool is at maximum size, throw exception
-            throw new InvalidOperationException($"Pool hat die maximale Größe von {data.MaxSize} erreicht.");
+            throw new InvalidOperationException($"Pool has reached maximum size of {data.MaxSize}.");
         }
     }
     
@@ -141,7 +141,7 @@ public abstract class PoolObject<T> where T : class, new()
                 return obj;
             }
             // Pool is at maximum size, throw exception
-            throw new InvalidOperationException($"Pool hat die maximale Größe von {data.MaxSize} erreicht.");
+            throw new InvalidOperationException($"Pool has reached maximum size of {data.MaxSize}.");
         }
     }
 
@@ -281,7 +281,8 @@ public abstract class PoolObject<T> where T : class, new()
         var data = GetPoolData();
         lock (data.Lock)
         {
-            if (!data.Pool.TryTake(out var item)) return;
+            if (!data.Pool.Contains(obj)) return;
+            data.Pool.TryTake(out var item);
             Interlocked.Decrement(ref data.CurrentPoolSize);
             Interlocked.Decrement(ref data.CurrentActiveCount);
                 

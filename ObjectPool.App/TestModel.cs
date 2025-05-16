@@ -1,26 +1,21 @@
 namespace ObjectPool.App;
 
-public class TestModel : PoolObject<TestModel>
+public class TestModel(string id, string name, string description) : PoolObject<TestModel>
 {
-    public TestModel()
+    public TestModel() : this(Guid.NewGuid().ToString(), "TestModel", "This is a test model.")
     {
-        Id = Guid.NewGuid().ToString();
-        Name = "TestModel";
-        Description = "This is a test model.";
     }
-    
-    public TestModel(string id, string name, string description) 
-    {
-        Id = id;
-        Name = name;
-        Description = description;
-    }
-    
-    public string Id { get; set; }
-    public string Name { get; set; }
-    public string Description { get; set; }
+
+    public string Id { get; set; } = id;
+    public string Name { get; set; } = name;
+    public string Description { get; set; } = description;
+
     protected override void Reset()
     {
-        Console.WriteLine("Reset");
+        Console.WriteLine("Resetting TestModel object");
+        Name = "TestModel";
+        Description = "This is a test model.";
+        // ID remains unchanged as it's a unique identifier
     }
 }
+
