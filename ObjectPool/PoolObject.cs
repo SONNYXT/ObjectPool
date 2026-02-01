@@ -1,30 +1,85 @@
 ﻿using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace ObjectPool;
 
 /// <summary>
-/// Abstract base class that implements an object pool pattern for any reference type.
+/// Abstract base class that implements a high-performance object pool pattern for any reference type.
 /// Objects are managed in a thread-safe pool to reduce garbage collection pressure.
 /// </summary>
 /// <typeparam name="T">The type of object to pool. Must be a class with a parameterless constructor.</typeparam>
 public abstract class PoolObject<T> where T : class, new()
 {
     private static readonly ConcurrentDictionary<Type, PoolData> Pools = new();
-    
-    private class PoolData
+
+    private sealed class PoolData
     {
-        public readonly ConcurrentBag<T> Pool = [];
-        public readonly object Lock = new();
+        // ConcurrentQueue provides better FIFO semantics and less cache contention than ConcurrentBag
+        public readonly ConcurrentQueue<T> Pool = new();
         public int CurrentPoolSize;
         public int CurrentActiveCount;
         public int MaxSize = 1000;
+
+        // SpinLock is faster than Monitor for short critical sections
+        private SpinLock _spinLock = new(enableThreadOwnerTracking: false);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void EnterLock(ref bool lockTaken) => _spinLock.Enter(ref lockTaken);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ExitLock() => _spinLock.Exit(useMemoryBarrier: false);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static PoolData GetPoolData()
     {
-        return Pools.GetOrAdd(typeof(T), _ => new PoolData());
+        return Pools.GetOrAdd(typeof(T), static _ => new PoolData());
     }
-    
+
+    /// <summary>
+    /// Configures the pool with the specified options. Should be called before first use.
+    /// </summary>
+    /// <param name="maxSize">The maximum number of objects the pool can hold. Default is 1000.</param>
+    /// <param name="preWarmCount">Optional number of objects to pre-create in the pool.</param>
+    /// <remarks>
+    /// This method should ideally be called once at application startup before any Get() calls.
+    /// If the pool is already in use, existing objects will be preserved unless the new maxSize
+    /// is smaller than the current pool size (in which case the pool will be cleared).
+    /// </remarks>
+    /// <example>
+    /// // Configure at startup
+    /// TestModel.Configure(maxSize: 500, preWarmCount: 50);
+    /// </example>
+    public static void Configure(int maxSize = 1000, int preWarmCount = 0)
+    {
+        if (maxSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxSize), "Max size must be greater than 0.");
+
+        var data = GetPoolData();
+        var lockTaken = false;
+        try
+        {
+            data.EnterLock(ref lockTaken);
+            data.MaxSize = maxSize;
+
+            // If the pool is too large, clear it
+            if (Volatile.Read(ref data.CurrentPoolSize) > maxSize)
+            {
+                ClearInternal(data);
+            }
+        }
+        finally
+        {
+            if (lockTaken) data.ExitLock();
+        }
+
+        // Pre-warm the pool if requested
+        if (preWarmCount > 0)
+        {
+            Create(preWarmCount);
+        }
+    }
+
     /// <summary>
     /// Gets or sets the maximum size of the pool.
     /// If the current pool size exceeds the new value, the pool will be cleared.
@@ -35,18 +90,24 @@ public abstract class PoolObject<T> where T : class, new()
     /// </remarks>
     public static int MaxPoolSize
     {
-        get => GetPoolData().MaxSize;
+        get => Volatile.Read(ref GetPoolData().MaxSize);
         set
         {
             var data = GetPoolData();
-            lock (data.Lock)
+            var lockTaken = false;
+            try
             {
+                data.EnterLock(ref lockTaken);
                 data.MaxSize = value;
                 // If the pool is too large, clear it to match the new maximum size
-                if (data.CurrentPoolSize > value)
+                if (Volatile.Read(ref data.CurrentPoolSize) > value)
                 {
-                    Clear();
+                    ClearInternal(data);
                 }
+            }
+            finally
+            {
+                if (lockTaken) data.ExitLock();
             }
         }
     }
@@ -57,7 +118,7 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// Active objects are those that have been retrieved with Get() but not yet returned with Release().
     /// </remarks>
-    public static int CountActive => GetPoolData().CurrentActiveCount;
+    public static int CountActive => Volatile.Read(ref GetPoolData().CurrentActiveCount);
 
     /// <summary>
     /// Returns the number of currently inactive (available) objects in the pool.
@@ -73,8 +134,8 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// This includes both active and inactive objects being managed by the pool.
     /// </remarks>
-    public static int CurrentSize =>  GetPoolData().CurrentPoolSize;
-    
+    public static int CurrentSize => Volatile.Read(ref GetPoolData().CurrentPoolSize);
+
     /// <summary>
     /// Retrieves an object from the pool or creates a new one if the pool is empty and not full.
     /// </summary>
@@ -85,30 +146,94 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// This method is thread-safe and can be called concurrently.
     /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static T Get()
     {
         var data = GetPoolData();
-        // Try to get an object from the pool
-        if (data.Pool.TryTake(out var item))
+
+        // Fast path: try to get an object from the pool without locking
+        if (data.Pool.TryDequeue(out var item))
         {
             Interlocked.Increment(ref data.CurrentActiveCount);
             return item;
         }
-        lock (data.Lock)
-        {
-            // If the pool is not full, create a new object
-            if (data.CurrentPoolSize < data.MaxSize)
-            {
-                var obj = Activator.CreateInstance<T>();
-                Interlocked.Increment(ref data.CurrentPoolSize);
-                Interlocked.Increment(ref data.CurrentActiveCount);
-                return obj!;
-            }
-            // Pool is at maximum size, throw exception
-            throw new InvalidOperationException($"Pool has reached maximum size of {data.MaxSize}.");
-        }
+
+        // Slow path: need to create a new object
+        return GetSlow(data);
     }
-    
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static T GetSlow(PoolData data)
+    {
+        // Try lock-free creation first using Compare-And-Swap
+        var currentSize = Volatile.Read(ref data.CurrentPoolSize);
+        var maxSize = Volatile.Read(ref data.MaxSize);
+
+        while (currentSize < maxSize)
+        {
+            if (Interlocked.CompareExchange(ref data.CurrentPoolSize, currentSize + 1, currentSize) == currentSize)
+            {
+                // Successfully reserved a slot, create the object
+                var obj = new T();
+                Interlocked.Increment(ref data.CurrentActiveCount);
+                return obj;
+            }
+            // CAS failed, re-read and retry
+            currentSize = Volatile.Read(ref data.CurrentPoolSize);
+            maxSize = Volatile.Read(ref data.MaxSize);
+        }
+
+        // Pool is at maximum size
+        throw new InvalidOperationException($"Pool has reached maximum size of {maxSize}.");
+    }
+
+    /// <summary>
+    /// Attempts to retrieve an object from the pool without throwing an exception.
+    /// </summary>
+    /// <param name="item">When this method returns, contains the retrieved object if successful; otherwise, null.</param>
+    /// <returns>true if an object was successfully retrieved; otherwise, false.</returns>
+    /// <remarks>
+    /// This method is preferred over Get() when pool exhaustion is expected.
+    /// It avoids the overhead of exception handling.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool TryGet(out T? item)
+    {
+        var data = GetPoolData();
+
+        // Fast path: try to get an object from the pool
+        if (data.Pool.TryDequeue(out item))
+        {
+            Interlocked.Increment(ref data.CurrentActiveCount);
+            return true;
+        }
+
+        // Slow path: try to create a new object
+        return TryGetSlow(data, out item);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryGetSlow(PoolData data, out T? item)
+    {
+        var currentSize = Volatile.Read(ref data.CurrentPoolSize);
+        var maxSize = Volatile.Read(ref data.MaxSize);
+
+        while (currentSize < maxSize)
+        {
+            if (Interlocked.CompareExchange(ref data.CurrentPoolSize, currentSize + 1, currentSize) == currentSize)
+            {
+                item = new T();
+                Interlocked.Increment(ref data.CurrentActiveCount);
+                return true;
+            }
+            currentSize = Volatile.Read(ref data.CurrentPoolSize);
+            maxSize = Volatile.Read(ref data.MaxSize);
+        }
+
+        item = null;
+        return false;
+    }
+
     /// <summary>
     /// Retrieves an object from the pool using a custom factory function, or creates a new one if the pool is empty and not full.
     /// </summary>
@@ -121,28 +246,41 @@ public abstract class PoolObject<T> where T : class, new()
     /// This method is thread-safe and can be called concurrently.
     /// The factory function is only called if a new object needs to be created.
     /// </remarks>
-    public static T? Get(Func<T> factory)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static T Get(Func<T> factory)
     {
         var data = GetPoolData();
-        // Try to get an object from the pool
-        if (data.Pool.TryTake(out var item))
+
+        // Fast path: try to get an object from the pool
+        if (data.Pool.TryDequeue(out var item))
         {
             Interlocked.Increment(ref data.CurrentActiveCount);
             return item;
         }
-        lock (data.Lock)
+
+        // Slow path: create using factory
+        return GetSlowWithFactory(data, factory);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static T GetSlowWithFactory(PoolData data, Func<T> factory)
+    {
+        var currentSize = Volatile.Read(ref data.CurrentPoolSize);
+        var maxSize = Volatile.Read(ref data.MaxSize);
+
+        while (currentSize < maxSize)
         {
-            // If the pool is not full, create a new object using the factory function
-            if (data.CurrentPoolSize < data.MaxSize)
+            if (Interlocked.CompareExchange(ref data.CurrentPoolSize, currentSize + 1, currentSize) == currentSize)
             {
                 var obj = factory();
-                Interlocked.Increment(ref data.CurrentPoolSize);
                 Interlocked.Increment(ref data.CurrentActiveCount);
                 return obj;
             }
-            // Pool is at maximum size, throw exception
-            throw new InvalidOperationException($"Pool has reached maximum size of {data.MaxSize}.");
+            currentSize = Volatile.Read(ref data.CurrentPoolSize);
+            maxSize = Volatile.Read(ref data.MaxSize);
         }
+
+        throw new InvalidOperationException($"Pool has reached maximum size of {maxSize}.");
     }
 
     /// <summary>
@@ -157,24 +295,23 @@ public abstract class PoolObject<T> where T : class, new()
     public static IEnumerable<T> Get(int count)
     {
         var data = GetPoolData();
-        var result = new List<T>();
-        // Try to get requested number of objects from the pool
+        var result = new List<T>(Math.Min(count, data.Pool.Count));
+
         for (var i = 0; i < count; i++)
         {
-            if (data.Pool.TryTake(out var item))
+            if (data.Pool.TryDequeue(out var item))
             {
                 result.Add(item);
                 Interlocked.Increment(ref data.CurrentActiveCount);
             }
             else
             {
-                // Pool is empty, break the loop
                 break;
             }
         }
         return result;
     }
-    
+
     /// <summary>
     /// Pre-fills the pool with a specified number of objects.
     /// </summary>
@@ -188,19 +325,27 @@ public abstract class PoolObject<T> where T : class, new()
     {
         if (count <= 0) return;
         var data = GetPoolData();
-        lock (data.Lock)
+
+        for (var i = 0; i < count; i++)
         {
-            // Calculate how many objects we can actually create without exceeding the max size
-            var canCreate = Math.Min(count, data.MaxSize - data.CurrentPoolSize);
-            for (var i = 0; i < canCreate; i++)
+            var currentSize = Volatile.Read(ref data.CurrentPoolSize);
+            var maxSize = Volatile.Read(ref data.MaxSize);
+
+            if (currentSize >= maxSize) break;
+
+            if (Interlocked.CompareExchange(ref data.CurrentPoolSize, currentSize + 1, currentSize) == currentSize)
             {
-                var obj = Activator.CreateInstance<T>();
-                data.Pool.Add(obj);
-                Interlocked.Increment(ref data.CurrentPoolSize);
+                var obj = new T();
+                data.Pool.Enqueue(obj);
+            }
+            else
+            {
+                // CAS failed, retry this iteration
+                i--;
             }
         }
     }
-    
+
     /// <summary>
     /// Pre-fills the pool with a specified number of objects created by the provided factory.
     /// </summary>
@@ -215,15 +360,22 @@ public abstract class PoolObject<T> where T : class, new()
     {
         if (count <= 0) return;
         var data = GetPoolData();
-        lock (data.Lock)
+
+        for (var i = 0; i < count; i++)
         {
-            // Calculate how many objects we can actually create without exceeding the max size
-            var canCreate = Math.Min(count, data.MaxSize - data.CurrentPoolSize);
-            for (var i = 0; i < canCreate; i++)
+            var currentSize = Volatile.Read(ref data.CurrentPoolSize);
+            var maxSize = Volatile.Read(ref data.MaxSize);
+
+            if (currentSize >= maxSize) break;
+
+            if (Interlocked.CompareExchange(ref data.CurrentPoolSize, currentSize + 1, currentSize) == currentSize)
             {
                 var obj = factory();
-                data.Pool.Add(obj);
-                Interlocked.Increment(ref data.CurrentPoolSize);
+                data.Pool.Enqueue(obj);
+            }
+            else
+            {
+                i--;
             }
         }
     }
@@ -237,15 +389,18 @@ public abstract class PoolObject<T> where T : class, new()
     /// Passing null is safe and will be ignored.
     /// This method is thread-safe and can be called concurrently.
     /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Release(T? obj)
     {
         if (obj == null) return;
         var data = GetPoolData();
+
         // Reset the object state if it's a PoolObject
         if (obj is PoolObject<T> poolObj)
             poolObj.Reset();
+
         // Return the object to the pool
-        data.Pool.Add(obj);
+        data.Pool.Enqueue(obj);
         Interlocked.Decrement(ref data.CurrentActiveCount);
     }
 
@@ -259,41 +414,38 @@ public abstract class PoolObject<T> where T : class, new()
     /// </remarks>
     public static void Release(IEnumerable<T> objects)
     {
-        // Release each object individually
         foreach (var obj in objects)
         {
             Release(obj);
         }
     }
-    
+
     /// <summary>
-    /// Removes and disposes a specific object from the pool.
+    /// Removes an active object from pool management and disposes it if applicable.
     /// </summary>
-    /// <param name="obj">The object to remove and dispose from the pool.</param>
+    /// <param name="obj">The active object to destroy.</param>
     /// <remarks>
-    /// This method permanently removes the object from the pool and reduces the current pool size.
+    /// This method permanently removes an active object from pool tracking and reduces the pool size.
+    /// Use this for objects that should not be returned to the pool (e.g., corrupted state).
     /// If the object implements IDisposable, it will be properly disposed.
-    /// This method is thread-safe and can be called concurrently.
+    /// This method is thread-safe.
     /// </remarks>
-    public static void Destroy(T obj)
+    public static void Destroy(T? obj)
     {
-        // Remove the object from the pool
+        if (obj == null) return;
         var data = GetPoolData();
-        lock (data.Lock)
+
+        // Decrement counters for the destroyed object
+        Interlocked.Decrement(ref data.CurrentPoolSize);
+        Interlocked.Decrement(ref data.CurrentActiveCount);
+
+        // Dispose the object if it implements IDisposable
+        if (obj is IDisposable disposable)
         {
-            if (!data.Pool.Contains(obj)) return;
-            data.Pool.TryTake(out var item);
-            Interlocked.Decrement(ref data.CurrentPoolSize);
-            Interlocked.Decrement(ref data.CurrentActiveCount);
-                
-            // Dispose the object if it implements IDisposable
-            if (item is IDisposable disposable)
-            {
-                disposable.Dispose();
-            }
+            disposable.Dispose();
         }
     }
-    
+
     /// <summary>
     /// Disposes all IDisposable objects in the pool and clears it.
     /// </summary>
@@ -306,35 +458,37 @@ public abstract class PoolObject<T> where T : class, new()
     public static void Dispose()
     {
         var data = GetPoolData();
-        lock (data.Lock)
+        var lockTaken = false;
+        try
         {
+            data.EnterLock(ref lockTaken);
+
             // Dispose any IDisposable objects in the pool
-            foreach (var obj in data.Pool)
+            while (data.Pool.TryDequeue(out var obj))
             {
                 if (obj is IDisposable disposable)
                 {
                     disposable.Dispose();
                 }
             }
-            // Clear the pool and reset counters
-            data.Pool.Clear();
+
+            // Reset counters
             data.CurrentPoolSize = 0;
             data.CurrentActiveCount = 0;
+        }
+        finally
+        {
+            if (lockTaken) data.ExitLock();
         }
     }
 
     /// <summary>
     /// Clears the pool and resets counters.
     /// </summary>
-    /// <remarks>
-    /// Internal use only. To properly dispose objects, use Dispose() instead.
-    /// This method removes all objects from the pool without disposing them.
-    /// </remarks>
-    private static void Clear()
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ClearInternal(PoolData data)
     {
-        var data = GetPoolData();
-        // Remove all objects from the pool without disposing them
-        while (data.Pool.TryTake(out _)) { }
+        while (data.Pool.TryDequeue(out _)) { }
         data.CurrentPoolSize = 0;
         data.CurrentActiveCount = 0;
     }
@@ -348,5 +502,84 @@ public abstract class PoolObject<T> where T : class, new()
     /// This ensures objects are in a clean state when retrieved from the pool later.
     /// </remarks>
     protected abstract void Reset();
+}
+
+/// <summary>
+/// A disposable wrapper that automatically returns the pooled object when disposed.
+/// Enables using-statement pattern for automatic resource management.
+/// </summary>
+/// <typeparam name="T">The type of pooled object.</typeparam>
+public readonly struct PooledObject<T> : IDisposable where T : PoolObject<T>, new()
+{
+    /// <summary>
+    /// Gets the pooled object instance.
+    /// </summary>
+    public T Value { get; }
+
+    /// <summary>
+    /// Gets whether this instance contains a valid object.
+    /// </summary>
+    public bool HasValue => Value != null;
+
+    internal PooledObject(T value)
+    {
+        Value = value;
+    }
+
+    /// <summary>
+    /// Returns the object to the pool.
+    /// </summary>
+    public void Dispose()
+    {
+        if (Value != null)
+        {
+            PoolObject<T>.Release(Value);
+        }
+    }
+
+    /// <summary>
+    /// Implicit conversion to the underlying type.
+    /// </summary>
+    public static implicit operator T(PooledObject<T> pooled) => pooled.Value;
+}
+
+/// <summary>
+/// Extension methods for PoolObject to support the PooledObject wrapper.
+/// </summary>
+public static class PoolObjectExtensions
+{
+    /// <summary>
+    /// Gets an object from the pool wrapped in a PooledObject for automatic disposal.
+    /// </summary>
+    /// <typeparam name="T">The type of pooled object.</typeparam>
+    /// <returns>A PooledObject wrapper that will return the object to the pool when disposed.</returns>
+    /// <example>
+    /// using var pooled = PoolObjectExtensions.GetScoped&lt;MyClass&gt;();
+    /// pooled.Value.DoSomething();
+    /// // Object is automatically returned to pool at end of scope
+    /// </example>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static PooledObject<T> GetScoped<T>() where T : PoolObject<T>, new()
+    {
+        return new PooledObject<T>(PoolObject<T>.Get());
+    }
+
+    /// <summary>
+    /// Tries to get an object from the pool wrapped in a PooledObject for automatic disposal.
+    /// </summary>
+    /// <typeparam name="T">The type of pooled object.</typeparam>
+    /// <param name="pooled">The resulting PooledObject wrapper.</param>
+    /// <returns>true if an object was retrieved; otherwise, false.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool TryGetScoped<T>(out PooledObject<T> pooled) where T : PoolObject<T>, new()
+    {
+        if (PoolObject<T>.TryGet(out var item) && item != null)
+        {
+            pooled = new PooledObject<T>(item);
+            return true;
+        }
+        pooled = default;
+        return false;
+    }
 }
 

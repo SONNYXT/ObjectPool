@@ -59,7 +59,7 @@ Console.WriteLine($"Name: {poolObject3.Name}");
 Console.WriteLine($"Id: {poolObject3.Id}");
 Console.WriteLine($"Count Active: {TestModel.CountActive}");
 Console.WriteLine($"Count Inactive: {TestModel.CountInactive}");
-    
+
 var poolObject4 = TestModel.Get();
 poolObject4.Name = "TestModel6";
 Console.WriteLine($"Name: {poolObject4.Name}");

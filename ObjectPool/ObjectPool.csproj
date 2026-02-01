@@ -1,9 +1,30 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net9.0</TargetFramework>
+        <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <LangVersion>latest</LangVersion>
+        
+        <!-- NuGet Package Metadata -->
+        <PackageId>ObjectPool</PackageId>
+        <Version>1.0.0</Version>
+        <Authors>SONNYXT</Authors>
+        <Description>A high-performance, thread-safe object pooling library for .NET that reduces garbage collection pressure by reusing objects.</Description>
+        <PackageTags>object-pool;pooling;performance;memory;gc;threading</PackageTags>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageProjectUrl>https://github.com/SONNYXT/ObjectPool</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/SONNYXT/ObjectPool.git</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        
+        <!-- Build Settings -->
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>$(NoWarn);1591</NoWarn>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
 
 </Project>
