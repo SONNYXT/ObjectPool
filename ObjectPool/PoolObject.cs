@@ -118,7 +118,10 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// Active objects are those that have been retrieved with Get() but not yet returned with Release().
     /// </remarks>
-    public static int CountActive => Volatile.Read(ref GetPoolData().CurrentActiveCount);
+    public static int CountActive
+    {
+        get => Volatile.Read(ref GetPoolData().CurrentActiveCount);
+    }
 
     /// <summary>
     /// Returns the number of currently inactive (available) objects in the pool.
@@ -126,7 +129,10 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// Inactive objects are those currently available in the pool, ready to be retrieved.
     /// </remarks>
-    public static int CountInactive => GetPoolData().Pool.Count;
+    public static int CountInactive
+    {
+        get => GetPoolData().Pool.Count;
+    }
 
     /// <summary>
     /// Returns the current size of the pool (total managed objects).
@@ -134,7 +140,10 @@ public abstract class PoolObject<T> where T : class, new()
     /// <remarks>
     /// This includes both active and inactive objects being managed by the pool.
     /// </remarks>
-    public static int CurrentSize => Volatile.Read(ref GetPoolData().CurrentPoolSize);
+    public static int CurrentSize
+    {
+        get => Volatile.Read(ref GetPoolData().CurrentPoolSize);
+    }
 
     /// <summary>
     /// Retrieves an object from the pool or creates a new one if the pool is empty and not full.
@@ -152,14 +161,11 @@ public abstract class PoolObject<T> where T : class, new()
         var data = GetPoolData();
 
         // Fast path: try to get an object from the pool without locking
-        if (data.Pool.TryDequeue(out var item))
-        {
-            Interlocked.Increment(ref data.CurrentActiveCount);
-            return item;
-        }
+        if (!data.Pool.TryDequeue(out var item)) return GetSlow(data);
+        Interlocked.Increment(ref data.CurrentActiveCount);
+        return item;
 
         // Slow path: need to create a new object
-        return GetSlow(data);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -202,14 +208,11 @@ public abstract class PoolObject<T> where T : class, new()
         var data = GetPoolData();
 
         // Fast path: try to get an object from the pool
-        if (data.Pool.TryDequeue(out item))
-        {
-            Interlocked.Increment(ref data.CurrentActiveCount);
-            return true;
-        }
+        if (!data.Pool.TryDequeue(out item)) return TryGetSlow(data, out item);
+        Interlocked.Increment(ref data.CurrentActiveCount);
+        return true;
 
         // Slow path: try to create a new object
-        return TryGetSlow(data, out item);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -252,14 +255,11 @@ public abstract class PoolObject<T> where T : class, new()
         var data = GetPoolData();
 
         // Fast path: try to get an object from the pool
-        if (data.Pool.TryDequeue(out var item))
-        {
-            Interlocked.Increment(ref data.CurrentActiveCount);
-            return item;
-        }
+        if (!data.Pool.TryDequeue(out var item)) return GetSlowWithFactory(data, factory);
+        Interlocked.Increment(ref data.CurrentActiveCount);
+        return item;
 
         // Slow path: create using factory
-        return GetSlowWithFactory(data, factory);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -385,7 +385,7 @@ public abstract class PoolObject<T> where T : class, new()
     /// </summary>
     /// <param name="obj">The object to release back to the pool.</param>
     /// <remarks>
-    /// If the object is a subclass of PoolObject&lt;T&gt;, its Reset method will be called.
+    /// If the object is a subclass of PoolObject&lt;T&gt; its Reset method will be called.
     /// Passing null is safe and will be ignored.
     /// This method is thread-safe and can be called concurrently.
     /// </remarks>
@@ -519,7 +519,10 @@ public readonly struct PooledObject<T> : IDisposable where T : PoolObject<T>, ne
     /// <summary>
     /// Gets whether this instance contains a valid object.
     /// </summary>
-    public bool HasValue => Value != null;
+    public bool HasValue
+    {
+        get => Value != null;
+    }
 
     internal PooledObject(T value)
     {
@@ -542,44 +545,3 @@ public readonly struct PooledObject<T> : IDisposable where T : PoolObject<T>, ne
     /// </summary>
     public static implicit operator T(PooledObject<T> pooled) => pooled.Value;
 }
-
-/// <summary>
-/// Extension methods for PoolObject to support the PooledObject wrapper.
-/// </summary>
-public static class PoolObjectExtensions
-{
-    /// <summary>
-    /// Gets an object from the pool wrapped in a PooledObject for automatic disposal.
-    /// </summary>
-    /// <typeparam name="T">The type of pooled object.</typeparam>
-    /// <returns>A PooledObject wrapper that will return the object to the pool when disposed.</returns>
-    /// <example>
-    /// using var pooled = PoolObjectExtensions.GetScoped&lt;MyClass&gt;();
-    /// pooled.Value.DoSomething();
-    /// // Object is automatically returned to pool at end of scope
-    /// </example>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static PooledObject<T> GetScoped<T>() where T : PoolObject<T>, new()
-    {
-        return new PooledObject<T>(PoolObject<T>.Get());
-    }
-
-    /// <summary>
-    /// Tries to get an object from the pool wrapped in a PooledObject for automatic disposal.
-    /// </summary>
-    /// <typeparam name="T">The type of pooled object.</typeparam>
-    /// <param name="pooled">The resulting PooledObject wrapper.</param>
-    /// <returns>true if an object was retrieved; otherwise, false.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool TryGetScoped<T>(out PooledObject<T> pooled) where T : PoolObject<T>, new()
-    {
-        if (PoolObject<T>.TryGet(out var item) && item != null)
-        {
-            pooled = new PooledObject<T>(item);
-            return true;
-        }
-        pooled = default;
-        return false;
-    }
-}
-

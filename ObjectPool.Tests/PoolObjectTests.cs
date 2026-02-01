@@ -45,7 +45,7 @@ public class PoolObjectTests
     public void Get_WithFactory_ReturnsCustomObject()
     {
         // Arrange
-        string customName = "CustomObject";
+        const string customName = "CustomObject";
 
         // Act
         var obj = TestPoolObject.Get(() => new TestPoolObject { Name = customName });
